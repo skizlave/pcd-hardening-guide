@@ -1,6 +1,6 @@
 # pcd-hardening
 
-CIS hardening for Platform9 hypervisor data-plane hosts on Ubuntu 24.04.
+Ansible Playbook to implement CIS Benchmark Level 1 best practices and hardening for Platform9 hypervisor data-plane hosts on Ubuntu 24.04.
 
 ## Scope
 
