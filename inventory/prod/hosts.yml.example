@@ -1,0 +1,16 @@
+all:
+  children:
+    hypervisors:
+      hosts:
+        # Hypervisor node names and management IPs.
+        # Replace hostname and IP with your actual hypervisor details.
+        # Multiple hosts can be listed (uncomment as needed).
+        hypervisor-1:
+          ansible_host: 10.0.0.100
+          gateway_ip: "10.0.0.1"
+        # hypervisor-2:
+        #   ansible_host: 10.0.0.101
+        #   gateway_ip: "10.0.0.1"
+        # hypervisor-3:
+        #   ansible_host: 10.0.0.102
+        #   gateway_ip: "10.0.0.1"

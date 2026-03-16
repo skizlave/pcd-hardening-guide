@@ -1,0 +1,32 @@
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Ansible runtime artifacts
+*.retry
+ansible.log
+.ansible/
+
+# Python cache/virtualenv
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local-only overrides and secrets
+*.local.yml
+*.vault
+*.vault.*
+.env
+.env.*
+
+# Sensitive inventory and configuration files
+# (Committed as .example templates instead)
+inventory/prod/hosts.yml
+inventory/staging/
+vars/cis_hardening.yml

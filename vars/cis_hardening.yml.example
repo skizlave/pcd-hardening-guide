@@ -1,0 +1,192 @@
+---
+# =============================================================================
+# CIS Hardening Variables – Platform9 Hypervisor Data Plane (Ubuntu 24.04)
+# =============================================================================
+# Single source of variables for this project.
+# This file replaces former inventory/prod/group_vars/all.yml.
+# =============================================================================
+
+# NOTE: This is an example file. Copy to vars/cis_hardening.yml and update
+#       with your specific values (URLs, IP addresses, subnets, hostnames).
+
+# -----------------------------------------------------------------------------
+# Inventory/runtime defaults (merged from former group_vars/all.yml)
+# -----------------------------------------------------------------------------
+ansible_python_interpreter: auto_silent
+ansible_user: root
+ansible_become: false
+
+# -----------------------------------------------------------------------------
+# General
+# -----------------------------------------------------------------------------
+cis_apply_security_updates: true
+cis_enable_apparmor: false
+cis_configure_rsyslog: true
+
+# Permit root SSH login? CIS requires 'no'; set 'prohibit-password'
+# only if key-based root login is operationally required.
+cis_ssh_permit_root: "prohibit-password"
+
+# Restrict SSH to specific Unix groups (leave empty [] to skip)
+cis_ssh_allow_groups: []
+
+# Keep SSH access safe during firewall policy changes.
+# Empty list means allow SSH from anywhere.
+cis_ssh_allowed_sources: []
+
+# Ubuntu 24.04 service names
+cis_ssh_service_name: "ssh"
+cis_auditd_service_name: "auditd"
+
+# -----------------------------------------------------------------------------
+# Hypervisor data-plane networking
+# -----------------------------------------------------------------------------
+# Subnet that includes hypervisors and manager-reachable infrastructure.
+# Example: 10.0.0.0/24
+pf9_management_subnet: "10.0.0.0/24"
+
+# Optional list of management CIDRs used for management-scoped firewall rules.
+# When empty, pf9_management_subnet is used.
+cis_management_subnets: []
+
+# Manager hostname used by post-hardening connectivity check (TCP/443).
+# Example: manager.example.com or your-deployment.app.staging-pcd.platform9.com
+pcd_manager_endpoint: "your-manager-endpoint.example.com"
+
+# Outbound web destinations allowed from hypervisors.
+# These are the only HTTP/HTTPS destinations permitted.
+# Update with your actual required destinations.
+url_whitelist:
+  - "https://your-manager-endpoint.example.com"
+  - "https://your-s3-bucket.example.com/your-path"
+  - "http://security.ubuntu.com/ubuntu"
+  - "http://us.archive.ubuntu.com/ubuntu"
+  - "http://ubuntu-cloud.archive.canonical.com/ubuntu"
+  - "http://nova.clouds.archive.ubuntu.com/ubuntu"
+  - "https://wiki.ubuntu.com/OpenStack/CloudArchive"
+  - "https://python.org"
+
+# Backward-compatible HTTPS manager endpoint variable.
+cis_hypervisor_outbound_https_urls:
+  - "https://your-manager-endpoint.example.com"
+
+# Outbound non-web infrastructure ports.
+cis_hypervisor_outbound_global_ports:
+  - { port: "53", proto: "udp", comment: "DNS" }
+  - { port: "53", proto: "tcp", comment: "DNS" }
+  - { port: "123", proto: "udp", comment: "NTP" }
+
+# Outbound management/networking ports constrained to management subnets.
+cis_hypervisor_outbound_management_ports:
+  - { port: "4789", proto: "udp", comment: "VXLAN overlay" }
+  - { port: "6081", proto: "udp", comment: "Geneve overlay" }
+  - { port: "8472", proto: "udp", comment: "Flannel VXLAN" }
+  - { port: "16509", proto: "tcp", comment: "libvirt TLS migration" }
+  - { port: "49152:49261", proto: "tcp", comment: "QEMU live migration range" }
+  - { port: "9494", proto: "tcp", comment: "Image library" }
+  - { port: "8774", proto: "tcp", comment: "Nova API" }
+
+# Hypervisor-safe reverse path filtering mode.
+# 2 = loose mode (recommended for asymmetric/overlay networking).
+cis_hypervisor_rp_filter_value: "2"
+
+# Optional source CIDRs for overlay UDP ports (4789/6081/8472).
+# Keep empty to restrict overlay traffic to hypervisor node IPs only.
+cis_hypervisor_overlay_allowed_sources: []
+
+# Jump-host allowlist for direct VNC console access.
+# Use /32 entries only (example: "203.0.113.10/32"). Keep empty to block direct VNC.
+cis_hypervisor_console_ingress_whitelist: []
+
+# Set true only if direct VNC access is required.
+# Recommended: keep false and use noVNC (6080) allowlist instead.
+cis_hypervisor_allow_direct_vnc: false
+
+# Hypervisor external access allowlist for noVNC/image catalog.
+# Keep empty to block external access to these ports.
+cis_hypervisor_ingress_whitelist: []
+cis_hypervisor_external_allowed_ports:
+  - { port: 6080, proto: tcp, comment: "noVNC websocket proxy" }
+  - { port: 9494, proto: tcp, comment: "Image catalog" }
+
+# -----------------------------------------------------------------------------
+# Services to disable (CIS 2.2)
+# Excludes anything needed by hypervisors.
+# -----------------------------------------------------------------------------
+cis_services_to_disable:
+  - avahi-daemon
+  - cups
+  - isc-dhcp-server
+  - isc-dhcp-server6
+  - nis
+  - rpcbind
+  - rsync
+  - snmpd
+  - squid
+  - samba
+  - dovecot
+  - smbd
+  - nmbd
+  - vsftpd
+  - proftpd
+  - pure-ftpd
+  - telnet
+  - tftp
+  - talk
+  - chargen
+  - daytime
+  - echo
+
+# -----------------------------------------------------------------------------
+# CIS Network Sysctl Parameters (Section 3)
+# NOTE: ip_forward is intentionally NOT set to 0 here; hypervisor play keeps
+#       it enabled for routing/overlay traffic.
+# -----------------------------------------------------------------------------
+cis_sysctl_network_params:
+  - { name: "net.ipv4.conf.all.send_redirects",          value: "0" }
+  - { name: "net.ipv4.conf.default.send_redirects",      value: "0" }
+  - { name: "net.ipv4.conf.all.accept_source_route",     value: "0" }
+  - { name: "net.ipv4.conf.default.accept_source_route", value: "0" }
+  - { name: "net.ipv6.conf.all.accept_source_route",     value: "0" }
+  - { name: "net.ipv4.conf.all.accept_redirects",        value: "0" }
+  - { name: "net.ipv4.conf.default.accept_redirects",    value: "0" }
+  - { name: "net.ipv4.conf.all.secure_redirects",        value: "0" }
+  - { name: "net.ipv4.conf.default.secure_redirects",    value: "0" }
+  - { name: "net.ipv6.conf.all.accept_redirects",        value: "0" }
+  - { name: "net.ipv6.conf.default.accept_redirects",    value: "0" }
+  - { name: "net.ipv4.conf.all.log_martians",            value: "1" }
+  - { name: "net.ipv4.conf.default.log_martians",        value: "1" }
+  - { name: "net.ipv4.icmp_echo_ignore_broadcasts",      value: "1" }
+  - { name: "net.ipv4.icmp_ignore_bogus_error_responses", value: "1" }
+  - { name: "net.ipv4.tcp_syncookies",                   value: "1" }
+  - { name: "net.ipv4.conf.all.rp_filter",               value: "1" }
+  - { name: "net.ipv4.conf.default.rp_filter",           value: "1" }
+  - { name: "kernel.randomize_va_space",                 value: "2" }
+  - { name: "fs.suid_dumpable",                          value: "0" }
+  - { name: "kernel.core_uses_pid",                      value: "1" }
+  - { name: "kernel.dmesg_restrict",                     value: "1" }
+  - { name: "kernel.perf_event_paranoid",                value: "2" }
+  - { name: "kernel.kptr_restrict",                      value: "2" }
+  - { name: "net.ipv4.tcp_timestamps",                   value: "0" }
+
+# -----------------------------------------------------------------------------
+# PAM settings
+# -----------------------------------------------------------------------------
+cis_pam_deny: 5
+cis_pam_unlock_time: 900
+
+# -----------------------------------------------------------------------------
+# Password aging (login.defs)
+# -----------------------------------------------------------------------------
+cis_pass_max_days: 365
+cis_pass_min_days: 1
+cis_pass_warn_age: 7
+
+# -----------------------------------------------------------------------------
+# NTP servers (used by systemd-timesyncd override.conf)
+# -----------------------------------------------------------------------------
+cis_ntp_servers:
+  - "0.ubuntu.pool.ntp.org"
+  - "1.ubuntu.pool.ntp.org"
+  - "2.ubuntu.pool.ntp.org"
+  - "3.ubuntu.pool.ntp.org"

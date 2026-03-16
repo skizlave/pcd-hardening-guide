@@ -1,0 +1,1213 @@
+---
+# =============================================================================
+# CIS Ubuntu 24.04 LTS Level 1 Hardening Playbook
+# Platform9 Hypervisor Edition
+# =============================================================================
+# CIS Benchmark: Ubuntu Linux 24.04 LTS (adapted profile)
+#
+# Scope:
+#   - Applies to: hypervisors (KVM) only
+#   - Does NOT break required Platform9 SaaS communications from hypervisors
+#   - Does NOT break SSH management access
+#   - Does NOT break KVM/libvirt on hypervisor nodes
+#
+# Usage:
+#   Full run:
+#     ansible-playbook playbooks/cis-hardening.yml
+#   Run only a section (tags):
+#     ansible-playbook playbooks/cis-hardening.yml --tags kernel
+#     ansible-playbook playbooks/cis-hardening.yml --tags ssh
+#     ansible-playbook playbooks/cis-hardening.yml --tags firewall
+#     ansible-playbook playbooks/cis-hardening.yml --tags audit
+#   Dry-run:
+#     ansible-playbook playbooks/cis-hardening.yml --check
+#
+# Review vars/cis_hardening.yml for site-specific overrides before running.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# PLAY 1: Pre-flight checks
+# -----------------------------------------------------------------------------
+- name: CIS Hardening – pre-flight checks
+  hosts: hypervisors
+  gather_facts: true
+  tags: always
+
+  tasks:
+    - name: Assert Ubuntu 24.04
+      assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_major_version | int == 24
+        fail_msg: >
+          This playbook targets Ubuntu 24.04. Detected:
+          {{ ansible_distribution }} {{ ansible_distribution_version }}
+        success_msg: "OS check passed: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+    - name: Verify passwordless sudo is available
+      command: sudo -n true
+      changed_when: false
+      failed_when: false
+      register: sudo_check
+
+    - name: Capture running Platform9 services (pre-hardening snapshot)
+      service_facts:
+
+    - name: Record pre-hardening kernel parameters
+      command: sysctl -a
+      changed_when: false
+      register: sysctl_pre
+      ignore_errors: true
+
+# -----------------------------------------------------------------------------
+# PLAY 2: CIS Section 1 – Initial Setup (filesystem, packages, updates)
+# -----------------------------------------------------------------------------
+- name: CIS Section 1 – Initial Setup
+  hosts: hypervisors
+  become: true
+  gather_facts: true
+  tags: initial_setup
+
+  vars_files:
+    - ../vars/cis_hardening.yml
+
+  tasks:
+
+    # 1.1 Filesystem Configuration ------------------------------------------
+    - name: "CIS 1.1.1 | Disable unused/dangerous filesystems"
+      tags: filesystem
+      block:
+        - name: Disable cramfs filesystem
+          lineinfile:
+            path: /etc/modprobe.d/cis-disable-filesystems.conf
+            line: "install {{ item }} /bin/true"
+            create: true
+            mode: "0644"
+          loop:
+            - cramfs
+            - freevxfs
+            - jffs2
+            - hfs
+            - hfsplus
+            - squashfs
+            - udf
+
+        - name: Remove unused filesystem modules (if loaded)
+          community.general.modprobe:
+            name: "{{ item }}"
+            state: absent
+          loop:
+            - cramfs
+            - freevxfs
+            - jffs2
+            - hfs
+            - hfsplus
+            - udf
+          ignore_errors: true
+
+    # 1.2 Software Updates ---------------------------------------------------
+    - name: "CIS 1.8.1 | Ensure system is updated (security patches)"
+      tags: packages
+      apt:
+        upgrade: safe
+        update_cache: true
+        cache_valid_time: 3600
+      when: cis_apply_security_updates | default(true)
+
+    # 1.3 Mandatory Access Control (AppArmor) --------------------------------
+    - name: "CIS 1.6 | Ensure AppArmor is installed and enabled"
+      tags: apparmor
+      block:
+        - name: Install AppArmor packages
+          apt:
+            name:
+              - apparmor
+              - apparmor-utils
+            state: present
+            update_cache: true
+
+        - name: Ensure AppArmor is enabled in GRUB (idempotent check)
+          lineinfile:
+            path: /etc/default/grub
+            regexp: '^GRUB_CMDLINE_LINUX='
+            line: 'GRUB_CMDLINE_LINUX="apparmor=1 security=apparmor"'
+            backup: true
+          register: grub_change
+          notify: update grub
+
+        - name: Set all AppArmor profiles to enforce mode
+          command: aa-enforce /etc/apparmor.d/*
+          changed_when: false
+          ignore_errors: true  # Non-enforced profiles will warn – not fatal
+      when: cis_enable_apparmor | default(true) | bool
+
+    # 1.4 MOTD / Issue banners -----------------------------------------------
+    - name: "CIS 1.7 | Configure warning banners"
+      tags: banners
+      block:
+        - name: Set /etc/issue (local console banner)
+          copy:
+            dest: /etc/issue
+            content: |
+              ########################################################################
+              # AUTHORIZED USE ONLY                                                  #
+              # This system is the property of the organization. Unauthorized access #
+              # is prohibited and will be prosecuted to the full extent of the law.  #
+              ########################################################################
+            mode: "0644"
+
+        - name: Set /etc/issue.net (SSH pre-auth banner)
+          copy:
+            dest: /etc/issue.net
+            content: |
+              ########################################################################
+              # AUTHORIZED USE ONLY                                                  #
+              # This system is the property of the organization. Unauthorized access #
+              # is prohibited and will be prosecuted to the full extent of the law.  #
+              ########################################################################
+            mode: "0644"
+
+        - name: Check whether /etc/motd exists
+          stat:
+            path: /etc/motd
+          register: cis_motd_stat
+
+        - name: Restrict /etc/motd permissions
+          file:
+            path: /etc/motd
+            owner: root
+            group: root
+            mode: "0644"
+          when: cis_motd_stat.stat.exists
+
+  handlers:
+    - name: update grub
+      command: update-grub
+
+# -----------------------------------------------------------------------------
+# PLAY 3: CIS Section 2 – Services
+# -----------------------------------------------------------------------------
+- name: CIS Section 2 – Services
+  hosts: hypervisors
+  become: true
+  gather_facts: true
+  tags: services
+
+  vars_files:
+    - ../vars/cis_hardening.yml
+
+  tasks:
+
+    - name: Temporarily disable ufw during package installation phases
+      command: ufw --force disable
+      register: cis_ufw_disable_result
+      changed_when: "'firewall stopped' in (cis_ufw_disable_result.stdout | lower)"
+      failed_when: false
+      when: cis_disable_ufw_during_package_installs | default(true) | bool
+
+    # 2.1 inetd / xinetd -------------------------------------------------------
+    - name: "CIS 2.1 | Remove legacy inetd services"
+      tags: inetd
+      apt:
+        name:
+          - inetutils-inetd
+          - xinetd
+          - openbsd-inetd
+        state: absent
+        purge: true
+      ignore_errors: true
+
+    # 2.2 Time Synchronization -------------------------------------------------
+    - name: "CIS 2.1.1 | Ensure time synchronization is in use"
+      tags: ntp
+      block:
+        - name: Ensure systemd-timesyncd is installed
+          apt:
+            name: systemd-timesyncd
+            state: present
+            update_cache: false
+            lock_timeout: 300
+
+        - name: Remove chrony to avoid NTP service conflicts
+          apt:
+            name: chrony
+            state: absent
+            purge: true
+            lock_timeout: 300
+          ignore_errors: true
+
+        - name: Ensure timesyncd drop-in directory exists
+          file:
+            path: /etc/systemd/timesyncd.conf.d
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Configure systemd-timesyncd override
+          copy:
+            dest: /etc/systemd/timesyncd.conf.d/override.conf
+            content: |
+              [Time]
+              {% if cis_ntp_servers is defined and cis_ntp_servers | length > 0 %}
+              NTP={{ cis_ntp_servers | join(' ') }}
+              {% endif %}
+            owner: root
+            group: root
+            mode: "0644"
+            backup: true
+          notify: restart systemd-timesyncd
+
+        - name: Enable and start systemd-timesyncd
+          service:
+            name: systemd-timesyncd
+            state: started
+            enabled: true
+
+    # 2.3 Disable Unnecessary Services ----------------------------------------
+    - name: Gather service facts for service disable checks
+      tags: disable_services
+      service_facts:
+
+    - name: "CIS 2.2 | Disable unnecessary special-purpose services"
+      tags: disable_services
+      service:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop: "{{ cis_services_to_disable }}"
+      when:
+        - ansible_facts.services is defined
+        - item in ansible_facts.services or (item ~ '.service') in ansible_facts.services
+      ignore_errors: true   # Service may not be installed
+
+    - name: Gather installed package facts
+      tags: mta
+      package_facts:
+        manager: auto
+
+    # 2.4 Ensure mail transfer agent is localhost-only ------------------------
+    - name: "CIS 2.4 | Restrict MTA to localhost only"
+      tags: mta
+      lineinfile:
+        path: /etc/postfix/main.cf
+        regexp: '^inet_interfaces'
+        line: 'inet_interfaces = loopback-only'
+        backup: true
+      notify: restart postfix
+      when:
+        - ansible_facts.packages is defined
+        - "'postfix' in ansible_facts.packages"
+
+  handlers:
+    - name: update grub
+      command: update-grub
+
+    - name: restart systemd-timesyncd
+      service:
+        name: systemd-timesyncd
+        state: restarted
+
+    - name: restart postfix
+      service:
+        name: postfix
+        state: restarted
+      ignore_errors: true
+
+# -----------------------------------------------------------------------------
+# PLAY 4: CIS Section 3 – Network Configuration (kernel parameters + firewall)
+# -----------------------------------------------------------------------------
+- name: CIS Section 3 – Network Configuration
+  hosts: hypervisors
+  become: true
+  gather_facts: true
+  tags: network
+
+  vars_files:
+    - ../vars/cis_hardening.yml
+
+  tasks:
+
+    # 3.1 Disable unused network protocols ------------------------------------
+    - name: "CIS 3.1 | Disable unused network protocols"
+      tags: net_protocols
+      lineinfile:
+        path: /etc/modprobe.d/cis-disable-protocols.conf
+        line: "install {{ item }} /bin/true"
+        create: true
+        mode: "0644"
+      loop:
+        - dccp
+        - sctp
+        - rds
+        - tipc
+
+    # 3.2 Network kernel parameters -------------------------------------------
+    - name: "CIS 3.1-3.3 | Apply CIS network sysctl parameters"
+      tags: kernel,sysctl
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        sysctl_set: true
+        reload: true
+      loop: "{{ cis_sysctl_network_params }}"
+      ignore_errors: true   # Some params not present in all kernels
+
+    # 3.3 UFW Firewall --------------------------------------------------------
+    - name: "CIS 3.4 | Configure UFW firewall"
+      tags: firewall
+      block:
+        - name: Install ufw
+          apt:
+            name: ufw
+            state: present
+
+        - name: Pre-allow SSH from configured source CIDRs (lockout prevention)
+          ufw:
+            rule: allow
+            src: "{{ item }}"
+            port: "22"
+            proto: tcp
+            comment: "CIS – SSH management (pre-policy)"
+          loop: "{{ cis_ssh_allowed_sources | default([]) }}"
+          when: (cis_ssh_allowed_sources | default([])) | length > 0
+
+        - name: Pre-allow SSH from anywhere when no source CIDRs are configured
+          ufw:
+            rule: allow
+            port: "22"
+            proto: tcp
+            comment: "CIS – SSH management (pre-policy)"
+          when: (cis_ssh_allowed_sources | default([])) | length == 0
+
+        - name: Set ufw default deny incoming
+          ufw:
+            direction: incoming
+            policy: deny
+
+        - name: Set ufw default deny outgoing
+          ufw:
+            direction: outgoing
+            policy: deny
+
+        - name: Build effective management subnet list
+          set_fact:
+            cis_management_subnets_effective: >-
+              {{
+                (cis_management_subnets | default([]))
+                if ((cis_management_subnets | default([])) | length > 0)
+                else [pf9_management_subnet]
+              }}
+
+        - name: Allow outbound infrastructure services
+          ufw:
+            rule: allow
+            direction: out
+            to_port: "{{ item.port }}"
+            proto: "{{ item.proto }}"
+            comment: "CIS – outbound {{ item.comment }} to any"
+          loop: "{{ cis_hypervisor_outbound_global_ports | default([]) }}"
+
+        - name: Build outbound web URL allowlist
+          set_fact:
+            cis_outbound_web_urls: >-
+              {{
+                (
+                  (url_whitelist | default([]))
+                  if ((url_whitelist | default([])) | length > 0)
+                  else (cis_hypervisor_outbound_https_urls | default([]))
+                )
+                | reject('equalto', '')
+                | list
+              }}
+
+        - name: Build outbound web destination host/port list
+          set_fact:
+            cis_outbound_web_destinations: "{{ (cis_outbound_web_destinations | default([])) + [ {'host': _host, 'port': _port} ] }}"
+          vars:
+            _host: "{{ item | regex_replace('^[a-zA-Z][a-zA-Z0-9+.-]*://', '') | regex_replace('/.*$', '') | regex_replace(':\\d+$', '') }}"
+            _port: "{{ '443' if (item | regex_search('^https://')) else '80' }}"
+          loop: "{{ cis_outbound_web_urls }}"
+          when: item | length > 0
+
+        - name: Resolve outbound web destination hosts to IPv4 addresses
+          command: "getent ahostsv4 {{ item.host }}"
+          changed_when: false
+          failed_when: false
+          loop: "{{ cis_outbound_web_destinations | default([]) }}"
+          register: cis_outbound_web_host_resolution
+
+        - name: Allow outbound web to whitelisted destinations
+          ufw:
+            rule: allow
+            direction: out
+            to_ip: "{{ item.1.split()[0] }}"
+            to_port: "{{ item.0.item.port }}"
+            proto: tcp
+            comment: "CIS – outbound web {{ item.0.item.host }} -> {{ item.1.split()[0] }}:{{ item.0.item.port }}"
+          loop: "{{ cis_outbound_web_host_resolution.results | subelements('stdout_lines', skip_missing=True) }}"
+          when: item.1 is match('^[0-9]+(\\.[0-9]+){3}\\s')
+
+        - name: Allow outbound management services to management subnets
+          ufw:
+            rule: allow
+            direction: out
+            to_ip: "{{ item.0 }}"
+            to_port: "{{ item.1.port }}"
+            proto: "{{ item.1.proto }}"
+            comment: "CIS – outbound {{ item.1.comment }} to {{ item.0 }}"
+          loop: "{{ cis_management_subnets_effective | product(cis_hypervisor_outbound_management_ports | default([])) | list }}"
+
+        - name: Allow whitelisted external access to hypervisor noVNC and image catalog
+          ufw:
+            rule: allow
+            src: "{{ item.0 }}"
+            port: "{{ item.1.port | string }}"
+            proto: "{{ item.1.proto | default('tcp') }}"
+            comment: "CIS – Hypervisor {{ item.1.comment }}"
+          loop: "{{ (cis_hypervisor_ingress_whitelist | default([])) | product(cis_hypervisor_external_allowed_ports | default([])) | list }}"
+          when: (cis_hypervisor_ingress_whitelist | default([])) | length > 0
+
+        - name: Enable ufw (non-interactive)
+          command: ufw --force enable
+          changed_when: true
+          when: cis_enable_ufw_early | default(false) | bool
+
+# -----------------------------------------------------------------------------
+# PLAY 5: CIS Section 4 – Logging and Auditing
+# -----------------------------------------------------------------------------
+- name: CIS Section 4 – Logging and Auditing
+  hosts: hypervisors
+  become: true
+  gather_facts: true
+  tags: audit
+
+  vars_files:
+    - ../vars/cis_hardening.yml
+
+  tasks:
+
+    # 4.1 Configure auditd ----------------------------------------------------
+    - name: "CIS 4.1 | Install and configure auditd"
+      tags: auditd
+      block:
+        - name: Install auditd and plugins
+          apt:
+            name:
+              - auditd
+              - audispd-plugins
+            state: present
+            lock_timeout: 300
+            policy_rc_d: 101
+
+        - name: Deploy CIS auditd configuration
+          copy:
+            dest: /etc/audit/auditd.conf
+            content: |
+              # CIS-compliant auditd configuration
+              log_file = /var/log/audit/audit.log
+              log_format = RAW
+              log_group = root
+              priority_boost = 4
+              flush = INCREMENTAL_ASYNC
+              freq = 50
+              num_logs = 5
+              disp_qos = lossy
+              dispatcher = /sbin/audispd
+              name_format = NONE
+              max_log_file = 32
+              max_log_file_action = keep_logs
+              space_left = 75
+              space_left_action = email
+              action_mail_acct = root
+              admin_space_left = 50
+              admin_space_left_action = halt
+              disk_full_action = SUSPEND
+              disk_error_action = SUSPEND
+              tcp_listen_queue = 5
+              tcp_max_per_addr = 1
+              tcp_client_max_idle = 0
+              enable_krb5 = no
+              krb5_principal = auditd
+              distribute_network = no
+            mode: "0640"
+          notify: restart auditd
+
+        - name: Deploy CIS audit rules
+          copy:
+            dest: /etc/audit/rules.d/cis-pf9.rules
+            content: |
+              # CIS Ubuntu 24.04 Level 1 – Audit Rules (Platform9 edition)
+              # Generated by cis-hardening playbook
+
+              ## Remove all existing rules
+              -D
+
+              ## Buffer size
+              -b 8192
+
+              ## Failure mode: 1=printk, 2=panic
+              -f 1
+
+              # -------------------------------------------------------
+              # CIS 4.1.1: System calls – identity / privilege
+              # -------------------------------------------------------
+              -a always,exit -F arch=b64 -S setuid -F a0=0 -F exe=/usr/bin/su -k priv_esc
+              -a always,exit -F arch=b64 -S setresuid -F a0=0 -F exe=/usr/bin/newgrp -k priv_esc
+              -a always,exit -F arch=b64 -S execve -C uid!=euid -F euid=0 -k setuid
+
+              # -------------------------------------------------------
+              # CIS 4.1.2: File deletion by users
+              # -------------------------------------------------------
+              -a always,exit -F arch=b64 -S rename -S renameat -S unlink -S unlinkat -F auid>=1000 -F auid!=4294967295 -k delete
+
+              # -------------------------------------------------------
+              # CIS 4.1.3: Kernel module loading/unloading
+              # -------------------------------------------------------
+              -w /sbin/insmod -p x -k modules
+              -w /sbin/rmmod  -p x -k modules
+              -w /sbin/modprobe -p x -k modules
+              -a always,exit -F arch=b64 -S init_module -S delete_module -k modules
+
+              # -------------------------------------------------------
+              # CIS 4.1.4: Date/time modifications
+              # -------------------------------------------------------
+              -a always,exit -F arch=b64 -S adjtimex -S settimeofday -k time-change
+              -a always,exit -F arch=b64 -S clock_settime -k time-change
+              -w /etc/localtime -p wa -k time-change
+
+              # -------------------------------------------------------
+              # CIS 4.1.5: User/group modifications
+              # -------------------------------------------------------
+              -w /etc/group  -p wa -k identity
+              -w /etc/passwd -p wa -k identity
+              -w /etc/gshadow -p wa -k identity
+              -w /etc/shadow -p wa -k identity
+              -w /etc/security/opasswd -p wa -k identity
+
+              # -------------------------------------------------------
+              # CIS 4.1.6: Network environment changes
+              # -------------------------------------------------------
+              -a always,exit -F arch=b64 -S sethostname -S setdomainname -k system-locale
+              -w /etc/issue      -p wa -k system-locale
+              -w /etc/issue.net  -p wa -k system-locale
+              -w /etc/hosts      -p wa -k system-locale
+              -w /etc/networks   -p wa -k system-locale
+              -w /etc/network/   -p wa -k system-locale
+
+              # -------------------------------------------------------
+              # CIS 4.1.7: Sudo log
+              # -------------------------------------------------------
+              -w /var/log/sudo.log -p wa -k actions
+              -w /etc/sudoers      -p wa -k scope
+              -w /etc/sudoers.d/   -p wa -k scope
+
+              # -------------------------------------------------------
+              # CIS 4.1.8: SSH server configuration
+              # -------------------------------------------------------
+              -w /etc/ssh/sshd_config -p wa -k sshd
+
+              # -------------------------------------------------------
+              # CIS 4.1.9: Login / logout tracking
+              # -------------------------------------------------------
+              -w /var/log/faillog  -p wa -k logins
+              -w /var/log/lastlog  -p wa -k logins
+              -w /var/log/tallylog -p wa -k logins
+
+              # -------------------------------------------------------
+              # CIS 4.1.10: Session initiation
+              # -------------------------------------------------------
+              -w /var/run/utmp -p wa -k session
+              -w /var/log/wtmp -p wa -k logins
+              -w /var/log/btmp -p wa -k logins
+
+              # -------------------------------------------------------
+              # Platform9 specific: audit PF9 agent configuration
+              # -------------------------------------------------------
+              -w /etc/pf9/  -p wa -k pf9-config
+              -w /opt/pf9/  -p wa -k pf9-config
+
+              ## Make audit configuration immutable (requires reboot to change)
+              ## Uncomment when hardening is validated:
+              # -e 2
+            mode: "0640"
+          notify: restart auditd
+
+        - name: Enable and start auditd
+          service:
+            name: "{{ cis_auditd_service_name | default('auditd') }}"
+            state: started
+            enabled: true
+          when: not ansible_check_mode
+
+    # 4.2 Configure rsyslog ---------------------------------------------------
+    - name: "CIS 4.2 | Configure rsyslog"
+      tags: rsyslog
+      block:
+        - name: Install rsyslog
+          apt:
+            name: rsyslog
+            state: present
+
+        - name: Enable and start rsyslog
+          service:
+            name: rsyslog
+            state: started
+            enabled: true
+
+        - name: Set rsyslog file creation permissions (CIS 4.2.1.3)
+          lineinfile:
+            path: /etc/rsyslog.conf
+            regexp: '^\$FileCreateMode'
+            line: '$FileCreateMode 0640'
+            backup: true
+          notify: restart rsyslog
+      when: cis_configure_rsyslog | default(true) | bool
+
+    # 4.3 Logrotate -----------------------------------------------------------
+    - name: "CIS 4.3 | Ensure logrotate is configured"
+      tags: logrotate
+      block:
+        - name: Install logrotate
+          apt:
+            name: logrotate
+            state: present
+
+        - name: Verify logrotate runs daily
+          file:
+            path: /etc/cron.daily/logrotate
+            state: file
+          ignore_errors: true
+
+  handlers:
+    - name: restart auditd
+      service:
+        name: "{{ cis_auditd_service_name | default('auditd') }}"
+        state: restarted
+      when: not ansible_check_mode
+
+    - name: restart rsyslog
+      service:
+        name: rsyslog
+        state: restarted
+
+# -----------------------------------------------------------------------------
+# PLAY 6: CIS Section 5 – Access Control (SSH, PAM, sudo)
+# -----------------------------------------------------------------------------
+- name: CIS Section 5 – Access Control
+  hosts: hypervisors
+  become: true
+  gather_facts: true
+  tags: access
+
+  vars_files:
+    - ../vars/cis_hardening.yml
+
+  tasks:
+
+    # 5.1 SSH -----------------------------------------------------------------
+    - name: "CIS 5.2 | Harden SSH daemon configuration"
+      tags: ssh
+      block:
+        - name: Apply CIS SSH daemon settings
+          lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: "^#?{{ item.key }}\\s"
+            line: "{{ item.key }} {{ item.value }}"
+            backup: true
+          loop:
+            - { key: "Protocol",                    value: "2" }
+            - { key: "LogLevel",                    value: "VERBOSE" }
+            - { key: "X11Forwarding",               value: "no" }
+            - { key: "MaxAuthTries",                value: "4" }
+            - { key: "IgnoreRhosts",                value: "yes" }
+            - { key: "HostbasedAuthentication",     value: "no" }
+            - { key: "PermitRootLogin",             value: "{{ cis_ssh_permit_root | default('no') }}" }
+            - { key: "PermitEmptyPasswords",        value: "no" }
+            - { key: "PermitUserEnvironment",       value: "no" }
+            - { key: "Ciphers",                     value: "aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr" }
+            - { key: "MACs",                        value: "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256" }
+            - { key: "KexAlgorithms",               value: "curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group14-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,ecdh-sha2-nistp521,ecdh-sha2-nistp384,ecdh-sha2-nistp256" }
+            - { key: "ClientAliveInterval",         value: "300" }
+            - { key: "ClientAliveCountMax",         value: "3" }
+            - { key: "LoginGraceTime",              value: "60" }
+            - { key: "Banner",                      value: "/etc/issue.net" }
+            - { key: "AcceptEnv",                   value: "LANG LC_*" }
+            - { key: "UsePAM",                      value: "yes" }
+            - { key: "AllowTcpForwarding",          value: "no" }
+            - { key: "PrintLastLog",                value: "yes" }
+          notify: restart sshd
+
+        # Only restrict AllowUsers/AllowGroups if a list is supplied
+        - name: Restrict SSH access to allowed groups
+          lineinfile:
+            path: /etc/ssh/sshd_config
+            regexp: '^AllowGroups'
+            line: "AllowGroups {{ cis_ssh_allow_groups | join(' ') }}"
+            backup: true
+          when: cis_ssh_allow_groups is defined and cis_ssh_allow_groups | length > 0
+          notify: restart sshd
+
+        - name: Validate sshd_config syntax before restart
+          command: sshd -t
+          changed_when: false
+          register: sshd_test
+          failed_when: sshd_test.rc != 0
+
+    # 5.2 PAM -----------------------------------------------------------------
+    - name: "CIS 5.3 | Configure PAM password quality"
+      tags: pam
+      block:
+        - name: Install libpam-pwquality
+          apt:
+            name: libpam-pwquality
+            state: present
+
+        - name: Configure pwquality settings (CIS 5.3.1)
+          lineinfile:
+            path: /etc/security/pwquality.conf
+            regexp: "^#?{{ item.key }}\\s*="
+            line: "{{ item.key }} = {{ item.value }}"
+            create: true
+            backup: true
+          loop:
+            - { key: "minlen",    value: "14" }
+            - { key: "minclass",  value: "4" }
+            - { key: "dcredit",   value: "-1" }
+            - { key: "ucredit",   value: "-1" }
+            - { key: "ocredit",   value: "-1" }
+            - { key: "lcredit",   value: "-1" }
+            - { key: "maxrepeat", value: "3" }
+
+        - name: Configure PAM password retry limit (CIS 5.3.2)
+          lineinfile:
+            path: /etc/pam.d/common-auth
+            regexp: "pam_faillock"
+            line: "auth required pam_faillock.so preauth silent audit deny={{ cis_pam_deny }} unlock_time={{ cis_pam_unlock_time }}"
+            insertbefore: "pam_unix"
+            backup: true
+
+    # 5.3 Sudo ----------------------------------------------------------------
+    - name: "CIS 5.4 | Configure sudo"
+      tags: sudo
+      block:
+        - name: Ensure sudo is installed
+          apt:
+            name: sudo
+            state: present
+
+        - name: Require password for sudo (CIS 5.4.3)
+          lineinfile:
+            path: /etc/sudoers
+            regexp: "^Defaults.*NOPASSWD"
+            state: absent
+            validate: "visudo -cf %s"
+          ignore_errors: true
+
+        - name: Enable sudo log file (CIS 5.4.4)
+          lineinfile:
+            path: /etc/sudoers
+            regexp: "^Defaults.*logfile"
+            line: 'Defaults logfile="/var/log/sudo.log"'
+            validate: "visudo -cf %s"
+            backup: true
+
+        - name: Restrict su command to wheel/sudo group (CIS 5.6)
+          lineinfile:
+            path: /etc/pam.d/su
+            regexp: "pam_wheel"
+            line: "auth required pam_wheel.so use_uid"
+            backup: true
+
+    # 5.4 User / Password aging -----------------------------------------------
+    - name: "CIS 5.5 | Configure password aging policies"
+      tags: password
+      block:
+        - name: Set global password age in /etc/login.defs (CIS 5.5.1)
+          lineinfile:
+            path: /etc/login.defs
+            regexp: "^{{ item.key }}\\s"
+            line: "{{ item.key }}\t{{ item.value }}"
+            backup: true
+          loop:
+            - { key: "PASS_MAX_DAYS", value: "{{ cis_pass_max_days  | default(365) }}" }
+            - { key: "PASS_MIN_DAYS", value: "{{ cis_pass_min_days  | default(1)   }}" }
+            - { key: "PASS_WARN_AGE", value: "{{ cis_pass_warn_age  | default(7)   }}" }
+
+        - name: Set default umask in /etc/login.defs (CIS 5.5.4)
+          lineinfile:
+            path: /etc/login.defs
+            regexp: "^UMASK\\s"
+            line: "UMASK\t027"
+            backup: true
+
+        - name: Set default umask in /etc/bash.bashrc
+          lineinfile:
+            path: /etc/bash.bashrc
+            regexp: "^umask"
+            line: "umask 027"
+            backup: true
+
+        - name: Set default umask in /etc/profile
+          lineinfile:
+            path: /etc/profile
+            regexp: "^umask"
+            line: "umask 027"
+            backup: true
+
+  handlers:
+    - name: restart sshd
+      service:
+        name: "{{ cis_ssh_service_name | default('ssh') }}"
+        state: restarted
+
+# -----------------------------------------------------------------------------
+# PLAY 7: CIS Section 6 – System Maintenance
+# -----------------------------------------------------------------------------
+- name: CIS Section 6 – System Maintenance
+  hosts: hypervisors
+  become: true
+  gather_facts: true
+  tags: maintenance
+
+  vars_files:
+    - ../vars/cis_hardening.yml
+
+  tasks:
+
+    - name: Gather critical file existence facts
+      tags: permissions
+      stat:
+        path: "{{ item.path }}"
+      loop:
+        - { path: "/etc/passwd",      mode: "0644" }
+        - { path: "/etc/passwd-",     mode: "0600" }
+        - { path: "/etc/shadow",      mode: "0640" }
+        - { path: "/etc/shadow-",     mode: "0600" }
+        - { path: "/etc/group",       mode: "0644" }
+        - { path: "/etc/group-",      mode: "0600" }
+        - { path: "/etc/gshadow",     mode: "0640" }
+        - { path: "/etc/gshadow-",    mode: "0600" }
+        - { path: "/etc/sudoers",     mode: "0440" }
+        - { path: "/etc/ssh/sshd_config", mode: "0600" }
+        - { path: "/boot/grub/grub.cfg",  mode: "0400" }
+      register: cis_critical_file_stats
+
+    - name: "CIS 6.1 | Set critical file permissions"
+      tags: permissions
+      file:
+        path: "{{ item.item.path }}"
+        owner: "{{ item.item.owner | default('root') }}"
+        group: "{{ item.item.group | default('root') }}"
+        mode: "{{ item.item.mode }}"
+      loop: "{{ cis_critical_file_stats.results }}"
+      when: item.stat.exists
+
+    - name: "CIS 6.1.9 | Ensure no world-writable files exist (report only)"
+      tags: permissions
+      command: >
+        find / -xdev -type f -perm -0002
+        -not -path '/proc/*'
+        -not -path '/sys/*'
+        -not -path '/dev/*'
+        -not -path '/run/*'
+      changed_when: false
+      register: world_writable
+      ignore_errors: true
+
+    - name: Report world-writable files found
+      debug:
+        msg: "World-writable files (review manually): {{ world_writable.stdout_lines }}"
+      when: world_writable.stdout_lines | default([]) | length > 0
+      tags: permissions
+
+    - name: "CIS 6.2.2 | Ensure no legacy '+' entries in passwd/shadow/group"
+      tags: legacy_accounts
+      lineinfile:
+        path: "{{ item }}"
+        regexp: '^\+'
+        state: absent
+        backup: true
+      loop:
+        - /etc/passwd
+        - /etc/shadow
+        - /etc/group
+
+    - name: "CIS 6.2.8 | Ensure root is the only UID 0 account"
+      tags: root_uid
+      shell: |
+        awk -F: '($3 == 0 && $1 != "root") { print $1 }' /etc/passwd
+      changed_when: false
+      register: non_root_uid0
+      ignore_errors: true
+
+    - name: Warn if non-root UID 0 accounts found
+      debug:
+        msg: "WARNING: Non-root UID 0 accounts detected: {{ non_root_uid0.stdout_lines }}"
+      when: non_root_uid0.stdout_lines | default([]) | length > 0
+      tags: root_uid
+
+# -----------------------------------------------------------------------------
+# PLAY 8: Hypervisor-specific hardening (KVM nodes only)
+# -----------------------------------------------------------------------------
+- name: CIS Hardening – Hypervisor-specific settings
+  hosts: hypervisors
+  become: true
+  gather_facts: true
+  tags: hypervisor
+
+  vars_files:
+    - ../vars/cis_hardening.yml
+
+  tasks:
+
+    - name: Gather service facts for hypervisor service checks
+      service_facts:
+
+    - name: Ensure KVM/libvirt services are preserved and running
+      service:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop:
+        - libvirtd
+        - qemu-kvm
+      when:
+        - ansible_facts.services is defined
+        - item in ansible_facts.services or (item ~ '.service') in ansible_facts.services
+      ignore_errors: true   # qemu-kvm not a service on all distros
+
+    - name: "Hypervisor | Build overlay source allowlist"
+      set_fact:
+        cis_overlay_sources: >-
+          {{
+            (cis_hypervisor_overlay_allowed_sources | default([]))
+            if (cis_hypervisor_overlay_allowed_sources | default([]) | length > 0)
+            else (
+              groups['hypervisors']
+              | map('extract', hostvars, 'ansible_host')
+              | select('defined')
+              | unique
+              | list
+            )
+          }}
+      tags: firewall
+
+    - name: "Hypervisor | Remove broad overlay rules from anywhere"
+      ufw:
+        rule: allow
+        delete: true
+        port: "{{ item.port }}"
+        proto: "{{ item.proto }}"
+      loop: "{{ _overlay_ports }}"
+      vars:
+        _overlay_ports:
+          - { port: "4789", proto: "udp", comment: "VXLAN overlay" }
+          - { port: "6081", proto: "udp", comment: "Geneve overlay" }
+          - { port: "8472", proto: "udp", comment: "Flannel VXLAN" }
+      tags: firewall
+
+    - name: "Hypervisor | Allow VXLAN / Geneve overlay from approved sources"
+      ufw:
+        rule: allow
+        port: "{{ item.1.port }}"
+        proto: "{{ item.1.proto }}"
+        src: "{{ item.0 }}"
+        comment: "{{ item.1.comment }} from approved source"
+      loop: "{{ cis_overlay_sources | product(_overlay_ports) | list }}"
+      vars:
+        _overlay_ports:
+          - { port: "4789", proto: "udp", comment: "VXLAN overlay" }
+          - { port: "6081", proto: "udp", comment: "Geneve overlay" }
+          - { port: "8472", proto: "udp", comment: "Flannel VXLAN" }
+      tags: firewall
+
+    - name: "Hypervisor | Sysctl – allow IP forwarding for KVM routing"
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: "1"
+        sysctl_set: true
+        reload: true
+      tags: sysctl
+
+    - name: "Hypervisor | Sysctl – set loose reverse path filtering"
+      sysctl:
+        name: "{{ item }}"
+        value: "{{ cis_hypervisor_rp_filter_value | default('2') | string }}"
+        sysctl_set: true
+        reload: true
+      loop:
+        - net.ipv4.conf.all.rp_filter
+        - net.ipv4.conf.default.rp_filter
+      tags: sysctl
+
+    - name: "Hypervisor | Sysctl – apply rp_filter mode to active interfaces"
+      sysctl:
+        name: "net.ipv4.conf.{{ item }}.rp_filter"
+        value: "{{ cis_hypervisor_rp_filter_value | default('2') | string }}"
+        sysctl_set: true
+        reload: true
+      loop: "{{ ansible_interfaces | default([]) }}"
+      tags: sysctl
+      ignore_errors: true
+
+    - name: "Hypervisor | Sysctl – bridge netfilter for OVS overlays"
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        sysctl_set: true
+        reload: true
+      loop:
+        - { name: "net.bridge.bridge-nf-call-iptables",  value: "1" }
+        - { name: "net.bridge.bridge-nf-call-ip6tables", value: "1" }
+      tags: sysctl
+      ignore_errors: true   # bridge module may not be loaded yet
+
+    - name: "Hypervisor | Allow migration ports from management subnet(s)"
+      ufw:
+        rule: allow
+        src: "{{ item.0 }}"
+        port: "{{ item.1.port }}"
+        proto: tcp
+        comment: "{{ item.1.comment }}"
+      loop: "{{ (cis_management_subnets_effective | default(((cis_management_subnets | default([])) if ((cis_management_subnets | default([])) | length > 0) else [pf9_management_subnet])) ) | product(_hypervisor_migration_ports) | list }}"
+      vars:
+        _hypervisor_migration_ports:
+          - { port: "16509",        comment: "libvirt TLS migration" }
+          - { port: "49152:49261",  comment: "QEMU live migration range" }
+      tags: firewall
+
+    - name: "Hypervisor | Allow direct VNC console range from jump hosts"
+      ufw:
+        rule: allow
+        port: "5900:5999"
+        proto: tcp
+        src: "{{ item }}"
+        comment: "VNC console range from jump host"
+      loop: "{{ cis_hypervisor_console_ingress_whitelist | default([]) }}"
+      when:
+        - cis_hypervisor_allow_direct_vnc | default(false) | bool
+        - (cis_hypervisor_console_ingress_whitelist | default([])) | length > 0
+      tags: firewall
+
+    - name: "Hypervisor | Allow whitelisted external noVNC/image catalog access"
+      ufw:
+        rule: allow
+        src: "{{ item.0 }}"
+        port: "{{ item.1.port | string }}"
+        proto: "{{ item.1.proto | default('tcp') }}"
+        comment: "CIS – Hypervisor {{ item.1.comment }}"
+      loop: "{{ (cis_hypervisor_ingress_whitelist | default([])) | product(cis_hypervisor_external_allowed_ports | default([])) | list }}"
+      when: (cis_hypervisor_ingress_whitelist | default([])) | length > 0
+      tags: firewall
+
+# -----------------------------------------------------------------------------
+# PLAY 9: Post-hardening verification
+# -----------------------------------------------------------------------------
+- name: CIS Hardening – Post-hardening verification
+  hosts: hypervisors
+  become: true
+  gather_facts: false
+  tags: verify
+
+  tasks:
+
+    - name: Enable ufw (finalize non-interactive)
+      command: ufw --force enable
+      changed_when: true
+      when: not ansible_check_mode
+
+    - name: Gather service facts for post-hardening verification
+      service_facts:
+
+    - name: Verify SSH service is running
+      service:
+        name: "{{ cis_ssh_service_name | default('ssh') }}"
+        state: started
+      check_mode: true
+      register: sshd_status
+      ignore_errors: true
+
+    - name: Check whether auditd systemd unit exists
+      stat:
+        path: "/lib/systemd/system/{{ cis_auditd_service_name | default('auditd') }}.service"
+      register: cis_auditd_systemd_unit
+
+    - name: Check whether auditd init script exists
+      stat:
+        path: "/etc/init.d/{{ cis_auditd_service_name | default('auditd') }}"
+      register: cis_auditd_init_script
+
+    - name: Verify auditd is running
+      service:
+        name: "{{ cis_auditd_service_name | default('auditd') }}"
+        state: started
+      check_mode: true
+      register: auditd_status
+      ignore_errors: true
+      when:
+        - cis_auditd_systemd_unit.stat.exists or cis_auditd_init_script.stat.exists
+
+    - name: Verify ufw is active
+      command: ufw status
+      changed_when: false
+      register: ufw_status
+
+    - name: Verify systemd-timesyncd synchronization status
+      command: timedatectl show -p NTPSynchronized --value
+      changed_when: false
+      register: timesyncd_status
+      ignore_errors: true
+
+    - name: Verify hypervisor connectivity to manager (outbound 443)
+      wait_for:
+        host: "{{ pcd_manager_endpoint | default('platform9.io') }}"
+        port: 443
+        timeout: 10
+        state: started
+      ignore_errors: true
+      register: pf9_connectivity
+
+    - name: Post-hardening summary
+      debug:
+        msg:
+          - "=== CIS Hardening Verification ==="
+          - "Host: {{ inventory_hostname }}"
+          - "sshd: {{ 'OK' if sshd_status is not failed else 'FAILED' }}"
+          - "auditd: {{ 'SKIPPED (not installed)' if (auditd_status is not defined or (auditd_status.skipped | default(false))) else ('OK' if auditd_status is not failed else 'FAILED') }}"
+          - "ufw: {{ ufw_status.stdout_lines[0] | default('unknown') }}"
+          - "timesyncd: {{ 'OK' if (timesyncd_status.stdout | default('') | trim) == 'yes' else 'check manually' }}"
+          - "Manager connectivity (443): {{ 'OK' if pf9_connectivity is not failed else 'CHECK – may be expected if air-gapped' }}"
+
+  handlers:
+    - name: update grub
+      command: update-grub
+      listen: update grub
+
+    - name: restart sshd
+      service:
+        name: "{{ cis_ssh_service_name | default('ssh') }}"
+        state: restarted
+
+    - name: restart auditd
+      service:
+        name: "{{ cis_auditd_service_name | default('auditd') }}"
+        state: restarted
+      when: not ansible_check_mode
+
+    - name: restart rsyslog
+      service:
+        name: rsyslog
+        state: restarted
+
+    - name: restart chrony
+      service:
+        name: systemd-timesyncd
+        state: restarted
+
+    - name: restart postfix
+      service:
+        name: postfix
+        state: restarted
+      ignore_errors: true
