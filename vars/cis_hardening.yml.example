@@ -53,28 +53,13 @@ cis_management_subnets: []
 # Example: manager.example.com or your-deployment.app.staging-pcd.platform9.com
 pcd_manager_endpoint: "your-manager-endpoint.example.com"
 
-# Outbound web destinations allowed from hypervisors.
-# These are the only HTTP/HTTPS destinations permitted.
-# Update with your actual required destinations.
-url_whitelist:
-  - "https://your-manager-endpoint.example.com"
-  - "https://your-s3-bucket.example.com/your-path"
-  - "http://security.ubuntu.com/ubuntu"
-  - "http://us.archive.ubuntu.com/ubuntu"
-  - "http://ubuntu-cloud.archive.canonical.com/ubuntu"
-  - "http://nova.clouds.archive.ubuntu.com/ubuntu"
-  - "https://wiki.ubuntu.com/OpenStack/CloudArchive"
-  - "https://python.org"
-
-# Backward-compatible HTTPS manager endpoint variable.
-cis_hypervisor_outbound_https_urls:
-  - "https://your-manager-endpoint.example.com"
-
-# Outbound non-web infrastructure ports.
+# Outbound infrastructure ports.
 cis_hypervisor_outbound_global_ports:
   - { port: "53", proto: "udp", comment: "DNS" }
   - { port: "53", proto: "tcp", comment: "DNS" }
   - { port: "123", proto: "udp", comment: "NTP" }
+  - { port: "80", proto: "tcp", comment: "HTTP" }
+  - { port: "443", proto: "tcp", comment: "HTTPS" }
 
 # Outbound management/networking ports constrained to management subnets.
 cis_hypervisor_outbound_management_ports:

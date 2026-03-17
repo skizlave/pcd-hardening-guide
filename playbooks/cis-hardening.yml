@@ -409,45 +409,20 @@
             comment: "CIS – outbound {{ item.comment }} to any"
           loop: "{{ cis_hypervisor_outbound_global_ports | default([]) }}"
 
-        - name: Build outbound web URL allowlist
-          set_fact:
-            cis_outbound_web_urls: >-
-              {{
-                (
-                  (url_whitelist | default([]))
-                  if ((url_whitelist | default([])) | length > 0)
-                  else (cis_hypervisor_outbound_https_urls | default([]))
-                )
-                | reject('equalto', '')
-                | list
-              }}
-
-        - name: Build outbound web destination host/port list
-          set_fact:
-            cis_outbound_web_destinations: "{{ (cis_outbound_web_destinations | default([])) + [ {'host': _host, 'port': _port} ] }}"
-          vars:
-            _host: "{{ item | regex_replace('^[a-zA-Z][a-zA-Z0-9+.-]*://', '') | regex_replace('/.*$', '') | regex_replace(':\\d+$', '') }}"
-            _port: "{{ '443' if (item | regex_search('^https://')) else '80' }}"
-          loop: "{{ cis_outbound_web_urls }}"
-          when: item | length > 0
-
-        - name: Resolve outbound web destination hosts to IPv4 addresses
-          command: "getent ahostsv4 {{ item.host }}"
+        - name: Capture legacy managed outbound web ufw rules
+          command: >-
+            sh -c "ufw status numbered |
+            sed -n 's/^\\[\\([0-9]\\+\\)\\].*ALLOW OUT.*CIS .* outbound web .*/\\1/p' |
+            sort -rn"
           changed_when: false
-          failed_when: false
-          loop: "{{ cis_outbound_web_destinations | default([]) }}"
-          register: cis_outbound_web_host_resolution
+          register: cis_legacy_outbound_web_rule_numbers
 
-        - name: Allow outbound web to whitelisted destinations
-          ufw:
-            rule: allow
-            direction: out
-            to_ip: "{{ item.1.split()[0] }}"
-            to_port: "{{ item.0.item.port }}"
-            proto: tcp
-            comment: "CIS – outbound web {{ item.0.item.host }} -> {{ item.1.split()[0] }}:{{ item.0.item.port }}"
-          loop: "{{ cis_outbound_web_host_resolution.results | subelements('stdout_lines', skip_missing=True) }}"
-          when: item.1 is match('^[0-9]+(\\.[0-9]+){3}\\s')
+        - name: Remove legacy managed outbound web ufw rules
+          command: "ufw --force delete {{ item }}"
+          loop: "{{ cis_legacy_outbound_web_rule_numbers.stdout_lines | default([]) }}"
+          when:
+            - not ansible_check_mode
+            - (cis_legacy_outbound_web_rule_numbers.stdout_lines | default([])) | length > 0
 
         - name: Allow outbound management services to management subnets
           ufw:

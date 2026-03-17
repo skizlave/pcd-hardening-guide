@@ -11,8 +11,7 @@ This project hardens only hypervisors in the `hypervisors` inventory group.
 
 ## Network policy in this repo
 
-- Outbound web access is restricted to explicit URL allowlist entries in `vars/cis_hardening.yml` via `url_whitelist`
-- URL schemes map to outbound ports as expected: `https` -> `443/tcp`, `http` -> `80/tcp`
+- Outbound HTTP/HTTPS (`80/tcp`, `443/tcp`) is allowed to any destination
 - Outbound DNS/NTP and management/networking ports are explicitly allowlisted
 - Management/networking port rules are scoped to `cis_management_subnets` (or fallback `pf9_management_subnet`)
 
@@ -54,11 +53,9 @@ Important variables:
 | Variable | Purpose |
 |---|---|
 | `pcd_manager_endpoint` | Hostname checked in verification on `443/tcp` |
-| `url_whitelist` | Outbound web URL allowlist (the only permitted `http`/`https` destinations) |
-| `cis_hypervisor_outbound_global_ports` | Outbound infra ports (DNS/NTP) |
+| `cis_hypervisor_outbound_global_ports` | Outbound infra ports (DNS/NTP/HTTP/HTTPS) |
 | `cis_hypervisor_outbound_management_ports` | Outbound management/networking ports scoped to management subnets |
 | `cis_management_subnets` | Optional list of management CIDRs for scoped rules |
-| `cis_hypervisor_outbound_https_urls` | Backward-compatible fallback when `url_whitelist` is empty |
 | `cis_ssh_allowed_sources` | Optional SSH source CIDR restrictions |
 | `cis_hypervisor_ingress_whitelist` | Optional external allowlist for noVNC/image catalog |
 | `pf9_management_subnet` | Source CIDR for migration-related inbound rules |
@@ -87,7 +84,7 @@ cp vars/cis_hardening.yml.example vars/cis_hardening.yml
 # Edit vars/cis_hardening.yml:
 # - pcd_manager_endpoint (your manager URL)
 # - pf9_management_subnet (your management CIDR)
-# - url_whitelist (your required outbound destinations)
+# - cis_hypervisor_outbound_global_ports (global egress like DNS/NTP/HTTP/HTTPS)
 ```
 
 ### 3. Verify syntax
